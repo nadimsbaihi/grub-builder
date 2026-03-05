@@ -1,6 +1,6 @@
 FROM debian:trixie-slim AS builder
 
-ARG GRUB_TAG=grub-2.14
+ARG GRUB_TAG=debian/2.14-2
 ARG PKG_VERSION=2.14
 
 ENV DEBIAN_FRONTEND=noninteractive
