@@ -1,0 +1,449 @@
+From: bianbu-ci <bianbu-ci@spacemit.com>
+Date: Fri, 18 Jul 2025 09:31:59 +0800
+Subject: SpacemiT K1 RISC-V patches for GRUB 2.14
+
+Four functional changes for SpacemiT K1 / Milk-V Jupiter RISC-V hardware:
+
+1. EFI variable command (efivariable module) — read/export EFI variables
+   from GRUB, supporting global and SpacemiT vendor GUIDs.
+
+2. Block coalescing in filesystem reads — merge consecutive disk blocks
+   into single grub_disk_read() calls to reduce I/O overhead on K1.
+
+3. Firmware DTB bootargs merging — append GRUB kernel command line to
+   firmware-provided /chosen/bootargs instead of replacing them.
+
+4. RISC-V 64-bit EFI memory limit — restrict allocations to 4GB to
+   avoid relocation overflows on multi-range memory layouts.
+
+---
+ grub-core/Makefile.core.def          |   6 +
+ grub-core/commands/efi/efivariable.c | 166 ++++++++++++++++++++++++++++
+ grub-core/fs/fshelp.c                |  96 ++++++++--------
+ grub-core/loader/efi/linux.c         |  69 +++++++++++-
+ include/grub/efi/api.h               |   2 +
+ include/grub/riscv64/efi/memory.h    |   2 +-
+ 6 files changed, 293 insertions(+), 48 deletions(-)
+ create mode 100644 grub-core/commands/efi/efivariable.c
+
+diff --git a/grub-core/Makefile.core.def b/grub-core/Makefile.core.def
+index 4335a66..8289568 100644
+--- a/grub-core/Makefile.core.def
++++ b/grub-core/Makefile.core.def
+@@ -830,6 +830,12 @@ module = {
+   enable = efi;
+ };
+ 
++module = {
++  name = efivariable;
++  efi = commands/efi/efivariable.c;
++  enable = efi;
++};
++
+ module = {
+   name = efitextmode;
+   efi = commands/efi/efitextmode.c;
+diff --git a/grub-core/commands/efi/efivariable.c b/grub-core/commands/efi/efivariable.c
+new file mode 100644
+index 0000000..1989bd0
+--- /dev/null
++++ b/grub-core/commands/efi/efivariable.c
+@@ -0,0 +1,166 @@
++/* efivariable.c - Print EFI variables or update EFI variables to grub env. */
++/*
++ *  GRUB  --  GRand Unified Bootloader
++ *  Copyright (C) 2012  Free Software Foundation, Inc.
++ *
++ *  GRUB is free software: you can redistribute it and/or modify
++ *  it under the terms of the GNU General Public License as published by
++ *  the Free Software Foundation, either version 3 of the License, or
++ *  (at your option) any later version.
++ *
++ *  GRUB is distributed in the hope that it will be useful,
++ *  but WITHOUT ANY WARRANTY; without even the implied warranty of
++ *  MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
++ *  GNU General Public License for more details.
++ *
++ *  You should have received a copy of the GNU General Public License
++ *  along with GRUB.  If not, see <http://www.gnu.org/licenses/>.
++ */
++#include <grub/types.h>
++#include <grub/efi/efi.h>
++#include <grub/command.h>
++#include <grub/env.h>
++#include <grub/dl.h>
++#include <grub/efi/api.h>
++#include <grub/err.h>
++#include <grub/extcmd.h>
++#include <grub/i18n.h>
++#include <grub/misc.h>
++#include <grub/mm.h>
++
++GRUB_MOD_LICENSE ("GPLv3+");
++
++static char*
++efi_variable_get (const char *name, grub_guid_t *guid)
++{
++  char *val = NULL, *env_str;
++  grub_size_t val_size = 0;
++
++  grub_efi_get_variable (name, guid, &val_size, (void **) &val);
++
++  if (val && val_size)
++  {
++    // make sure string is end with '\0'
++    env_str = grub_malloc (val_size + 1);
++    grub_strncpy (env_str, (const char *)val, val_size);
++    env_str[val_size] = 0;
++    grub_free (val);
++    return env_str;
++  }
++  else
++    return NULL;
++}
++
++static grub_err_t
++efi_variable_print (const char *name, grub_guid_t *guid)
++{
++  char *val;
++
++  val = efi_variable_get(name, guid);
++  if (val)
++  {
++    grub_printf ("%s = %s\n", name, val);
++    grub_free (val);
++    return GRUB_ERR_NONE;
++  }
++  else
++  {
++    grub_printf ("%s NOT exist in EFI variables\n", name);
++    return GRUB_ERR_ACCESS_DENIED;
++  }
++}
++
++static grub_err_t
++efi_variable_update_with_guid (const char *name, grub_guid_t *guid)
++{
++  char *val;
++
++  val = efi_variable_get(name, guid);
++  if (val)
++  {
++    grub_printf ("Set env %s with %s\n", name, val);
++    grub_env_set (name, val);
++    grub_free (val);
++    return GRUB_ERR_NONE;
++  }
++  else
++  {
++    grub_printf ("%s NOT exist in EFI variables\n", name);
++    return GRUB_ERR_ACCESS_DENIED;
++  }
++}
++
++static grub_err_t
++grub_cmd_efi_variable (grub_command_t cmd __attribute__ ((unused)),
++		int argc __attribute__ ((unused)),
++		char **args __attribute__ ((unused)))
++{
++  grub_guid_t *guid_ptr = NULL;
++  static grub_guid_t global = GRUB_EFI_GLOBAL_VARIABLE_GUID;
++  static grub_guid_t spacemit = GRUB_EFI_SPACEMIT_PRODUCT_VARIABLE_GUID;
++  int arg_idx = 0;
++
++  /* Check for GUID option */
++  if (argc >= 3 && grub_strcmp(args[arg_idx], "-g") == 0)
++  {
++    arg_idx++;
++
++    /* Check for predefined GUIDs */
++    if (grub_strcmp(args[arg_idx], "global") == 0)
++    {
++      guid_ptr = &global;
++      grub_printf("Using global GUID\n");
++    }
++    else if (grub_strcmp(args[arg_idx], "spacemit") == 0)
++    {
++      guid_ptr = &spacemit;
++      grub_printf("Using SpacemiT product GUID\n");
++    }
++    else
++    {
++      grub_printf("Unknown GUID name: %s\n", args[arg_idx]);
++      grub_printf("Supported GUID names: global, spacemit\n");
++      return GRUB_ERR_BAD_ARGUMENT;
++    }
++
++    arg_idx++;
++  }
++  else
++  {
++    grub_printf("Using default global GUID\n");
++    guid_ptr = &global;
++  }
++
++  /* Process command */
++  if (argc > arg_idx + 1 && grub_strcmp(args[arg_idx], "update") == 0)
++  {
++    grub_printf("Updating variable: %s\n", args[arg_idx + 1]);
++    return efi_variable_update_with_guid (args[arg_idx + 1], guid_ptr);
++  }
++  else if (argc > arg_idx + 1 && grub_strcmp(args[arg_idx], "print") == 0)
++  {
++    grub_printf("Printing variable: %s\n", args[arg_idx + 1]);
++    return efi_variable_print (args[arg_idx + 1], guid_ptr);
++  }
++  else
++  {
++    grub_printf("Invalid command: expected 'update' or 'print'\n");
++    return GRUB_ERR_BAD_ARGUMENT;
++  }
++}
++
++static grub_command_t cmd = NULL;
++
++GRUB_MOD_INIT(efivariable)
++{
++  cmd = grub_register_command ("efienv", grub_cmd_efi_variable,
++                                N_("[-g GUID] [print|update] VARIABLE"),
++                                N_("Print EFI variables or update EFI variables to env. "
++                                   "Use -g to specify a custom GUID (global or spacemit)."));
++}
++
++GRUB_MOD_FINI(efivariable)
++{
++  if (cmd)
++  	grub_unregister_command (cmd);
++}
+diff --git a/grub-core/fs/fshelp.c b/grub-core/fs/fshelp.c
+index cb41934..691e561 100644
+--- a/grub-core/fs/fshelp.c
++++ b/grub-core/fs/fshelp.c
+@@ -387,55 +387,73 @@ grub_fshelp_read_file (grub_disk_t disk, grub_fshelp_node_t node,
+ 
+   blockcnt = ((len + pos) + blocksize - 1) >> (log2blocksize + GRUB_DISK_SECTOR_BITS);
+ 
+-  for (i = pos >> (log2blocksize + GRUB_DISK_SECTOR_BITS); i < blockcnt; i++)
+-    {
+-      grub_disk_addr_t blknr;
+-      int blockoff = pos & (blocksize - 1);
+-      int blockend = blocksize;
++  for (i = pos >> (log2blocksize + GRUB_DISK_SECTOR_BITS); i < blockcnt;) {
++    grub_disk_addr_t blknr, continuous_start;
++    grub_size_t continuous_count = 1;
++    int blockoff = pos & (blocksize - 1);
+ 
+-      int skipfirst = 0;
++    continuous_start = blknr = get_block(node, i);
+ 
+-      blknr = get_block (node, i);
+-      if (grub_errno)
+-	return -1;
++    if (grub_errno)
++      return -1;
+ 
+-      blknr = blknr << log2blocksize;
++    // Only look for continuous blocks if we have a valid block number
++    if (blknr) {
++      while (i + continuous_count < blockcnt) {
++        grub_disk_addr_t next_blknr = get_block(node, i + continuous_count);
++        if (grub_errno)
++          return -1;
+ 
+-      /* Last block.  */
+-      if (i == blockcnt - 1)
+-	{
+-	  blockend = (len + pos) & (blocksize - 1);
++        if (next_blknr != blknr + 1 || next_blknr == 0) {
++          break;
++        }
+ 
+-	  /* The last portion is exactly blocksize.  */
+-	  if (! blockend)
+-	    blockend = blocksize;
+-	}
++        blknr = next_blknr;
++        continuous_count++;
++      }
++    }
+ 
+-      /* First block.  */
+-      if (i == (pos >> (log2blocksize + GRUB_DISK_SECTOR_BITS)))
+-	{
+-	  skipfirst = blockoff;
+-	  blockend -= skipfirst;
+-	}
++    // Calculate the number of bytes to read this time
++    grub_size_t total_read = blocksize;
+ 
+-      /* If the block number is 0 this block is not stored on disk but
+-	 is zero filled instead.  */
+-      if (blknr)
+-	{
+-	  disk->read_hook = read_hook;
+-	  disk->read_hook_data = read_hook_data;
++    if (continuous_count > 1) {
++      total_read = blocksize * continuous_count;
++    }
+ 
+-	  grub_disk_read (disk, blknr + blocks_start, skipfirst,
+-			  blockend, buf);
+-	  disk->read_hook = 0;
+-	  if (grub_errno)
+-	    return -1;
+-	}
+-      else
+-	grub_memset (buf, 0, blockend);
++    // Handle the offset of the first block
++    if (i == (pos >> (log2blocksize + GRUB_DISK_SECTOR_BITS))) {
++      total_read -= blockoff;
++    }
++
++    // Handle the last block
++    if (i + continuous_count == blockcnt) {
++      int last_block_bytes = (len + pos) & (blocksize - 1);
++      if (last_block_bytes) {
++        total_read -= (blocksize - last_block_bytes);
++      }
++    }
+ 
+-      buf += blocksize - skipfirst;
++    if (continuous_start) {
++      disk->read_hook = read_hook;
++      disk->read_hook_data = read_hook_data;
++
++      grub_disk_read(disk, 
++                    (continuous_start << log2blocksize) + blocks_start,
++                    blockoff,
++                    total_read,
++                    buf);
++
++      disk->read_hook = 0;
++      if (grub_errno) {
++        return -1;
++      }
++    } else {
++      grub_memset(buf, 0, total_read);
+     }
+ 
++    buf += total_read;
++    i += continuous_count;
++  }
++
+   return len;
+ }
+diff --git a/grub-core/loader/efi/linux.c b/grub-core/loader/efi/linux.c
+index 2b891d6..c64f8bb 100644
+--- a/grub-core/loader/efi/linux.c
++++ b/grub-core/loader/efi/linux.c
+@@ -135,6 +135,63 @@ grub_arch_efi_linux_load_image_header (grub_file_t file,
+ }
+ 
+ #if !defined(__i386__) && !defined(__x86_64__)
++static char *
++append_bootargs(char *bootargs, char *append)
++{
++  char *merged = NULL;
++  grub_size_t total_len, offset;
++
++  // Print env bootargs
++  grub_dprintf ("linux", "Base bootargs:\n\t%s\n", bootargs);
++  // Print DTS bootargs
++  grub_dprintf ("linux", "To append bootargs:\n\t%s\n", append);
++
++  if (!append)
++    return grub_strdup (bootargs);
++  if (!bootargs)
++    return grub_strdup (append);
++
++  total_len = grub_strlen (bootargs) + grub_strlen (append) + 2;
++  merged = grub_malloc (total_len);
++  if (!merged)
++  {
++    grub_error (GRUB_ERR_OUT_OF_MEMORY, "Memory allocation failed\n");
++    return grub_strdup (bootargs);
++  }
++
++  grub_strcpy (merged, bootargs);
++  offset = grub_strlen (bootargs);
++  merged[offset++] = ' ';
++  grub_strcpy (&merged[offset], append);
++  offset += grub_strlen (append);
++  merged[offset] = '\0';
++
++  return merged;
++}
++
++static grub_err_t
++update_linux_bootargs (void *fdt)
++{
++  int node;
++  const char *bootargs;
++  char *merged_bootargs;
++
++  node = grub_fdt_find_subnode (fdt, 0, "chosen");
++  if (node < 0)
++    return GRUB_ERR_NONE;
++
++  bootargs = grub_fdt_get_prop (fdt, node, "bootargs", NULL);
++  if (NULL == bootargs)
++    return GRUB_ERR_NONE;
++
++  // append bootargs in grub menu to the tail
++  merged_bootargs = append_bootargs ((char *)bootargs, linux_args);
++  grub_free (linux_args);
++  linux_args = merged_bootargs;
++
++  return GRUB_ERR_NONE;
++}
++
+ static grub_err_t
+ finalize_params_linux (void)
+ {
+@@ -142,14 +199,16 @@ finalize_params_linux (void)
+ 
+   void *fdt;
+ 
++  fdt = grub_fdt_load (GRUB_EFI_LINUX_FDT_EXTRA_SPACE);
++
++  if (!fdt)
++    goto failure;
++
++  update_linux_bootargs (fdt);
++
+   /* Set initrd info */
+   if (initrd_start && initrd_end > initrd_start)
+     {
+-      fdt = grub_fdt_load (GRUB_EFI_LINUX_FDT_EXTRA_SPACE);
+-
+-      if (!fdt)
+-       goto failure;
+-
+       node = grub_fdt_find_subnode (fdt, 0, "chosen");
+       if (node < 0)
+        node = grub_fdt_add_subnode (fdt, 0, "chosen");
+diff --git a/include/grub/efi/api.h b/include/grub/efi/api.h
+index 699bccf..943fd2a 100644
+--- a/include/grub/efi/api.h
++++ b/include/grub/efi/api.h
+@@ -1438,6 +1438,8 @@ struct grub_efi_runtime_services
+ #define GRUB_EFI_GLOBAL_VARIABLE_GUID \
+   { 0x8BE4DF61, 0x93CA, 0x11d2, { 0xAA, 0x0D, 0x00, 0xE0, 0x98, 0x03, 0x2B, 0x8C }}
+ 
++#define GRUB_EFI_SPACEMIT_PRODUCT_VARIABLE_GUID \
++  { 0x4F556D5E, 0xCF38, 0xCDF8, { 0x22, 0x9C, 0x01, 0x78, 0xD0, 0x0F, 0xF0, 0x43 }}
+ 
+   grub_efi_status_t
+   (__grub_efi_api *get_variable) (grub_efi_char16_t *variable_name,
+diff --git a/include/grub/riscv64/efi/memory.h b/include/grub/riscv64/efi/memory.h
+index c6cb324..eb6f1bb 100644
+--- a/include/grub/riscv64/efi/memory.h
++++ b/include/grub/riscv64/efi/memory.h
+@@ -1,6 +1,6 @@
+ #ifndef GRUB_MEMORY_CPU_HEADER
+ #include <grub/efi/memory.h>
+ 
+-#define GRUB_EFI_MAX_USABLE_ADDRESS 0xffffffffffffULL
++#define GRUB_EFI_MAX_USABLE_ADDRESS 0xffffffffULL
+ 
+ #endif /* ! GRUB_MEMORY_CPU_HEADER */
